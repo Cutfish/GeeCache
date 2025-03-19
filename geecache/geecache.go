@@ -32,6 +32,7 @@ type Group struct {
 	name      string
 	getter    Getter
 	mainCache cache
+	peers     PeerPicker
 }
 
 var (
@@ -39,8 +40,38 @@ var (
 	groups = make(map[string]*Group)
 )
 
-// 一个 Group 可以认为是一个缓存的命名空间，不同group缓存不同类型的数据
+// 实现了 PeerPicker 接口的 HTTPPool 注入到 Group 中
+func (g *Group) RegisterPeers(peers PeerPicker) {
+	if g.peers != nil {
+		panic("RegisterPeerPicker called more than once")
+	}
+	g.peers = peers
+}
 
+// 实现了 PeerGetter 接口的 httpGetter 从访问远程节点，获取缓存值。
+// 使用 PickPeer() 方法选择节点，若非本机节点，则调用 getFromPeer() 从远程获取。
+func (g *Group) load(key string) (value ByteView, err error) {
+	if g.peers != nil {
+		if peer, ok := g.peers.PickPeer(key); ok {
+			if value, err = g.getFromPeer(peer, key); err == nil {
+				return value, nil
+			}
+			log.Println("[GeeCache] Failed to get from peer", err)
+		}
+	}
+
+	return g.getLocally(key)
+}
+
+func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
+	bytes, err := peer.Get(g.name, key)
+	if err != nil {
+		return ByteView{}, err
+	}
+	return ByteView{b: bytes}, nil
+}
+
+// 一个 Group 可以认为是一个缓存的命名空间，不同group缓存不同类型的数据
 func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
 	if getter == nil {
 		panic("nil Getter")
@@ -64,7 +95,7 @@ func GetGroup(name string) *Group {
 	return g
 }
 
-// 从缓存中拿到一个key的value
+// 从本地缓存中拿到一个key的value
 func (g *Group) Get(key string) (ByteView, error) {
 	if key == "" {
 		return ByteView{}, fmt.Errorf("key is required")
@@ -75,12 +106,7 @@ func (g *Group) Get(key string) (ByteView, error) {
 		return v, nil
 	}
 
-	return g.load(key)
-}
-
-// 缓存未命中
-func (g *Group) load(key string) (value ByteView, err error) {
-	return g.getLocally(key)
+	return g.load(key) // 如果本地缓存没有，那就去分布式缓存中查找
 }
 
 func (g *Group) getLocally(key string) (ByteView, error) {
