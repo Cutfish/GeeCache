@@ -10,6 +10,8 @@ geecache/
 package geecache
 
 import (
+	pb "GeeCache/geecachepb/geecachepb"
+	"GeeCache/singleflight"
 	"fmt"
 	"log"
 	"sync"
@@ -33,43 +35,14 @@ type Group struct {
 	getter    Getter
 	mainCache cache
 	peers     PeerPicker
+	// 用*singleflight.Group确保每一个key只被获取一次
+	loader *singleflight.Group
 }
 
 var (
 	mu     sync.RWMutex
 	groups = make(map[string]*Group)
 )
-
-// 实现了 PeerPicker 接口的 HTTPPool 注入到 Group 中
-func (g *Group) RegisterPeers(peers PeerPicker) {
-	if g.peers != nil {
-		panic("RegisterPeerPicker called more than once")
-	}
-	g.peers = peers
-}
-
-// 实现了 PeerGetter 接口的 httpGetter 从访问远程节点，获取缓存值。
-// 使用 PickPeer() 方法选择节点，若非本机节点，则调用 getFromPeer() 从远程获取。
-func (g *Group) load(key string) (value ByteView, err error) {
-	if g.peers != nil {
-		if peer, ok := g.peers.PickPeer(key); ok {
-			if value, err = g.getFromPeer(peer, key); err == nil {
-				return value, nil
-			}
-			log.Println("[GeeCache] Failed to get from peer", err)
-		}
-	}
-
-	return g.getLocally(key)
-}
-
-func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
-	bytes, err := peer.Get(g.name, key)
-	if err != nil {
-		return ByteView{}, err
-	}
-	return ByteView{b: bytes}, nil
-}
 
 // 一个 Group 可以认为是一个缓存的命名空间，不同group缓存不同类型的数据
 func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
@@ -83,9 +56,54 @@ func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
 		name:      name,
 		getter:    getter, //缓存没有命中时获取源数据的回调
 		mainCache: cache{cacheBytes: cacheBytes},
+		loader:    &singleflight.Group{},
 	}
 	groups[name] = g
 	return g
+}
+
+// 实现了 PeerPicker 接口的 HTTPPool 注入到 Group 中
+func (g *Group) RegisterPeers(peers PeerPicker) {
+	if g.peers != nil {
+		panic("RegisterPeerPicker called more than once")
+	}
+	g.peers = peers
+}
+
+// 实现了 PeerGetter 接口的 httpGetter 从访问远程节点，获取缓存值。
+// 使用 PickPeer() 方法选择节点，若非本机节点，则调用 getFromPeer() 从远程获取。
+func (g *Group) load(key string) (value ByteView, err error) {
+	// 确保了并发场景下针对相同的 key，load 过程只会调用一次。
+	viewi, err := g.loader.Do(key, func() (interface{}, error) {
+		if g.peers != nil {
+			if peer, ok := g.peers.PickPeer(key); ok {
+				if value, err = g.getFromPeer(peer, key); err == nil {
+					return value, nil
+				}
+				log.Println("[GeeCache] Failed to get from peer", err)
+			}
+		}
+
+		return g.getLocally(key)
+	})
+
+	if err == nil {
+		return viewi.(ByteView), nil
+	}
+	return
+}
+
+func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
+	req := &pb.Request{
+		Group: g.name,
+		Key:   key,
+	}
+	res := &pb.Response{}
+	err := peer.Get(req, res)
+	if err != nil {
+		return ByteView{}, err
+	}
+	return ByteView{b: res.Value}, nil
 }
 
 func GetGroup(name string) *Group {
